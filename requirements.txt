@@ -1,0 +1,2 @@
+anthropic[bedrock,vertex]>=0.37.1
+jsonschema==4.22.0
