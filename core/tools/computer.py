@@ -1,17 +1,12 @@
 import asyncio
 import base64
-import os
-import shlex
-import shutil
+import io
 from enum import StrEnum
-from pathlib import Path
 from typing import Literal, TypedDict
-from uuid import uuid4
-
+import pyautogui
 from anthropic.types.beta import BetaToolComputerUse20241022Param
 
 from .base import BaseAnthropicTool, ToolError, ToolResult
-from .run import run
 
 OUTPUT_DIR = "/tmp/outputs"
 
@@ -30,20 +25,6 @@ Action = Literal[
     "screenshot",
     "cursor_position",
 ]
-
-
-class Resolution(TypedDict):
-    width: int
-    height: int
-
-
-# sizes above XGA/WXGA are not recommended (see README.md)
-# scale down to one of these targets if ComputerTool._scaling_enabled is set
-MAX_SCALING_TARGETS: dict[str, Resolution] = {
-    "XGA": Resolution(width=1024, height=768),  # 4:3
-    "WXGA": Resolution(width=1280, height=800),  # 16:10
-    "FWXGA": Resolution(width=1366, height=768),  # ~16:9
-}
 
 
 class ScalingSource(StrEnum):
@@ -73,17 +54,14 @@ class ComputerTool(BaseAnthropicTool):
     height: int
     display_num: int | None
 
-    _screenshot_delay = 2.0
+    _screenshot_delay = 1.0
     _scaling_enabled = True
 
     @property
     def options(self) -> ComputerToolOptions:
-        width, height = self.scale_coordinates(
-            ScalingSource.COMPUTER, self.width, self.height
-        )
         return {
-            "display_width_px": width,
-            "display_height_px": height,
+            "display_width_px": self.target_width,
+            "display_height_px": self.target_height,
             "display_number": self.display_num,
         }
 
@@ -93,46 +71,54 @@ class ComputerTool(BaseAnthropicTool):
     def __init__(self):
         super().__init__()
 
-        self.width = int(os.getenv("WIDTH") or 0)
-        self.height = int(os.getenv("HEIGHT") or 0)
-        assert self.width and self.height, "WIDTH, HEIGHT must be set"
-        if (display_num := os.getenv("DISPLAY_NUM")) is not None:
-            self.display_num = int(display_num)
-            self._display_prefix = f"DISPLAY=:{self.display_num} "
-        else:
-            self.display_num = None
-            self._display_prefix = ""
+        self.width = int(pyautogui.size()[0])
+        self.height = int(pyautogui.size()[1])
 
-        self.xdotool = f"{self._display_prefix}xdotool"
+        self.display_num = None  # Not used on MacOS
+
+        MAX_WIDTH = 1280  # Max screenshot width
+        if self.width > MAX_WIDTH:
+            self.scale_factor = MAX_WIDTH / self.width
+            self.target_width = MAX_WIDTH
+            self.target_height = int(self.height * self.scale_factor)
+        else:
+            self.scale_factor = 1.0
+            self.target_width = self.width
+            self.target_height = self.height
 
     async def __call__(
         self,
         *,
         action: Action,
         text: str | None = None,
-        coordinate: tuple[int, int] | None = None,
+        coordinate: list[int] | None = None,
         **kwargs,
     ):
+        print(
+            f"### Performing action: {action}{f", text: {text}" if text else ''}{f", coordinate: {coordinate}" if coordinate else ''}"
+        )
         if action in ("mouse_move", "left_click_drag"):
             if coordinate is None:
                 raise ToolError(f"coordinate is required for {action}")
             if text is not None:
                 raise ToolError(f"text is not accepted for {action}")
             if not isinstance(coordinate, list) or len(coordinate) != 2:
-                raise ToolError(f"{coordinate} must be a tuple of length 2")
+                raise ToolError("coordinate must be a list of length 2")
             if not all(isinstance(i, int) and i >= 0 for i in coordinate):
-                raise ToolError(f"{coordinate} must be a tuple of non-negative ints")
+                raise ToolError("coordinate must be a list of non-negative integers")
 
             x, y = self.scale_coordinates(
                 ScalingSource.API, coordinate[0], coordinate[1]
             )
 
             if action == "mouse_move":
-                return await self.shell(f"{self.xdotool} mousemove --sync {x} {y}")
+                await asyncio.to_thread(pyautogui.moveTo, x, y)
+                return ToolResult(output=f"Mouse moved successfully to X={x}, Y={y}")
             elif action == "left_click_drag":
-                return await self.shell(
-                    f"{self.xdotool} mousedown 1 mousemove --sync {x} {y} mouseup 1"
-                )
+                await asyncio.to_thread(pyautogui.mouseDown)
+                await asyncio.to_thread(pyautogui.moveTo, x, y)
+                await asyncio.to_thread(pyautogui.mouseUp)
+                return ToolResult(output="Mouse drag action completed.")
 
         if action in ("key", "type"):
             if text is None:
@@ -140,27 +126,51 @@ class ComputerTool(BaseAnthropicTool):
             if coordinate is not None:
                 raise ToolError(f"coordinate is not accepted for {action}")
             if not isinstance(text, str):
-                raise ToolError(output=f"{text} must be a string")
+                raise ToolError("text must be a string")
 
             if action == "key":
-                return await self.shell(f"{self.xdotool} key -- {text}")
+                # Handle key combinations and modifiers
+                # Replace 'super' with 'command'
+                key_sequence = text.lower().replace("super", "command").split("+")
+                key_sequence = [key.strip() for key in key_sequence]
+                # Map 'cmd' to 'command' for MacOS
+                key_sequence = [
+                    "command" if key == "cmd" else key for key in key_sequence
+                ]
+                # Handle special keys that pyautogui expects
+                special_keys = {
+                    "ctrl": "ctrl",
+                    "control": "ctrl",
+                    "alt": "alt",
+                    "option": "alt",
+                    "shift": "shift",
+                    "command": "command",
+                    "tab": "tab",
+                    "enter": "enter",
+                    "return": "enter",
+                    "esc": "esc",
+                    "escape": "esc",
+                    "space": "space",
+                    "spacebar": "space",
+                    "up": "up",
+                    "down": "down",
+                    "left": "left",
+                    "right": "right",
+                    # Add more special keys as needed
+                }
+                key_sequence = [special_keys.get(key, key) for key in key_sequence]
+                await asyncio.to_thread(pyautogui.hotkey, *key_sequence)
+                return ToolResult(output=f"Key combination '{text}' pressed.")
             elif action == "type":
-                results: list[ToolResult] = []
-                for chunk in chunks(text, TYPING_GROUP_SIZE):
-                    cmd = f"{self.xdotool} type --delay {TYPING_DELAY_MS} -- {shlex.quote(chunk)}"
-                    results.append(await self.shell(cmd, take_screenshot=False))
-                screenshot_base64 = (await self.screenshot()).base64_image
-                return ToolResult(
-                    output="".join(result.output or "" for result in results),
-                    error="".join(result.error or "" for result in results),
-                    base64_image=screenshot_base64,
+                await asyncio.to_thread(
+                    pyautogui.write, text, interval=TYPING_DELAY_MS / 1000.0
                 )
+                return ToolResult(output=f"Typed text: {text}")
 
         if action in (
             "left_click",
             "right_click",
             "double_click",
-            "middle_click",
             "screenshot",
             "cursor_position",
         ):
@@ -172,89 +182,47 @@ class ComputerTool(BaseAnthropicTool):
             if action == "screenshot":
                 return await self.screenshot()
             elif action == "cursor_position":
-                result = await self.shell(
-                    f"{self.xdotool} getmouselocation --shell",
-                    take_screenshot=False,
-                )
-                output = result.output or ""
-                x, y = self.scale_coordinates(
-                    ScalingSource.COMPUTER,
-                    int(output.split("X=")[1].split("\n")[0]),
-                    int(output.split("Y=")[1].split("\n")[0]),
-                )
-                return result.replace(output=f"X={x},Y={y}")
+                x, y = pyautogui.position()
+                x, y = self.scale_coordinates(ScalingSource.COMPUTER, int(x), int(y))
+                return ToolResult(output=f"X={x},Y={y}")
             else:
-                click_arg = {
-                    "left_click": "1",
-                    "right_click": "3",
-                    "middle_click": "2",
-                    "double_click": "--repeat 2 --delay 500 1",
-                }[action]
-                return await self.shell(f"{self.xdotool} click {click_arg}")
+                if action == "left_click":
+                    await asyncio.to_thread(pyautogui.click, button="left")
+                    return ToolResult(output="Left click performed.")
+                elif action == "right_click":
+                    await asyncio.to_thread(pyautogui.click, button="right")
+                    return ToolResult(output="Right click performed.")
+                elif action == "double_click":
+                    await asyncio.to_thread(pyautogui.doubleClick)
+                    return ToolResult(output="Double click performed.")
 
         raise ToolError(f"Invalid action: {action}")
 
     async def screenshot(self):
         """Take a screenshot of the current screen and return the base64 encoded image."""
-        output_dir = Path(OUTPUT_DIR)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        path = output_dir / f"screenshot_{uuid4().hex}.png"
+        # Capture screenshot using PyAutoGUI
+        screenshot = await asyncio.to_thread(pyautogui.screenshot)
 
-        # Try gnome-screenshot first
-        if shutil.which("gnome-screenshot"):
-            screenshot_cmd = f"{self._display_prefix}gnome-screenshot -f {path} -p"
-        else:
-            # Fall back to scrot if gnome-screenshot isn't available
-            screenshot_cmd = f"{self._display_prefix}scrot -p {path}"
+        if self._scaling_enabled and self.scale_factor < 1.0:
+            screenshot = screenshot.resize((self.target_width, self.target_height))
 
-        result = await self.shell(screenshot_cmd, take_screenshot=False)
-        if self._scaling_enabled:
-            x, y = self.scale_coordinates(
-                ScalingSource.COMPUTER, self.width, self.height
-            )
-            await self.shell(
-                f"convert {path} -resize {x}x{y}! {path}", take_screenshot=False
-            )
+        img_buffer = io.BytesIO()
+        # Save the image to an in-memory buffer
+        screenshot.save(img_buffer, format="PNG", optimize=True)
+        img_buffer.seek(0)
+        base64_image = base64.b64encode(img_buffer.read()).decode()
 
-        if path.exists():
-            return result.replace(
-                base64_image=base64.b64encode(path.read_bytes()).decode()
-            )
-        raise ToolError(f"Failed to take screenshot: {result.error}")
-
-    async def shell(self, command: str, take_screenshot=True) -> ToolResult:
-        """Run a shell command and return the output, error, and optionally a screenshot."""
-        _, stdout, stderr = await run(command)
-        base64_image = None
-
-        if take_screenshot:
-            # delay to let things settle before taking a screenshot
-            await asyncio.sleep(self._screenshot_delay)
-            base64_image = (await self.screenshot()).base64_image
-
-        return ToolResult(output=stdout, error=stderr, base64_image=base64_image)
+        return ToolResult(base64_image=base64_image)
 
     def scale_coordinates(self, source: ScalingSource, x: int, y: int):
-        """Scale coordinates to a target maximum resolution."""
+        """Scale coordinates between the assistant's coordinate system and the real screen coordinates."""
         if not self._scaling_enabled:
             return x, y
-        ratio = self.width / self.height
-        target_dimension = None
-        for dimension in MAX_SCALING_TARGETS.values():
-            # allow some error in the aspect ratio - not ratios are exactly 16:9
-            if abs(dimension["width"] / dimension["height"] - ratio) < 0.02:
-                if dimension["width"] < self.width:
-                    target_dimension = dimension
-                break
-        if target_dimension is None:
-            return x, y
-        # should be less than 1
-        x_scaling_factor = target_dimension["width"] / self.width
-        y_scaling_factor = target_dimension["height"] / self.height
+        x_scaling_factor = self.width / self.target_width
+        y_scaling_factor = self.height / self.target_height
         if source == ScalingSource.API:
-            if x > self.width or y > self.height:
-                raise ToolError(f"Coordinates {x}, {y} are out of bounds")
-            # scale up
+            # Assistant's coordinates -> real screen coordinates
+            return round(x * x_scaling_factor), round(y * y_scaling_factor)
+        else:
+            # Real screen coordinates -> assistant's coordinate system
             return round(x / x_scaling_factor), round(y / y_scaling_factor)
-        # scale down
-        return round(x * x_scaling_factor), round(y * y_scaling_factor)
