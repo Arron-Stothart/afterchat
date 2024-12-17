@@ -1,3 +1,7 @@
 anthropic[bedrock,vertex]>=0.37.1
 jsonschema==4.22.0
 pyautogui==0.9.54
+fastapi==0.95.0
+uvicorn[standard]
+websockets
+python-dotenv
